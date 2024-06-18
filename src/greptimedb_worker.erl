@@ -24,7 +24,7 @@
 -export([start_link/1, init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, async_handle/3]).
 -export([connect/1]).
 
--record(state, {channel, requests}).
+-record(state, {channel, channel_pid, requests}).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -48,6 +48,7 @@
 %% gen_server callbacks
 %% ===================================================================
 init(Args) ->
+    process_flag(trap_exit, true),
     logger:debug("[GreptimeDB] genserver has started (~w)~n", [self()]),
     Endpoints = proplists:get_value(endpoints, Args),
     SslOptions = proplists:get_value(ssl_opts, Args, []),
@@ -56,8 +57,8 @@ init(Args) ->
         lists:map(fun({Scheme, Host, Port}) -> {Scheme, Host, Port, ssl_options(Scheme, SslOptions)}
                   end, Endpoints),
     Channel = list_to_atom(pid_to_list(self())),
-    {ok, _} = grpcbox_channel_sup:start_child(Channel, Channels, Options),
-    {ok, #state{channel = Channel, requests = #{ pending => queue:new(), pending_count => 0}}}.
+    {ok, ChannelPid} = grpcbox_channel_sup:start_child(Channel, Channels, Options),
+    {ok, #state{channel = Channel, channel_pid = ChannelPid, requests = #{ pending => queue:new(), pending_count => 0}}}.
 
 handle_call({handle, Request}, _From, #state{channel = Channel} = State) ->
     Ctx = ctx:with_deadline_after(?REQUEST_TIMEOUT, millisecond),
@@ -90,11 +91,12 @@ handle_info(?ASYNC_REQ(Request, ExpireAt, ResultCallback), State0) ->
     State1 = enqueue_req(ResultCallback, Req, State0),
     State = maybe_shoot(State1, false),
     noreply_state(State);
-
 handle_info(timeout, State0) ->
     State = maybe_shoot(State0, true),
     noreply_state(State);
-
+handle_info({'EXIT', Pid, Reason}, State = #state{channel_pid = Pid}) ->
+    logger:error("[GreptimeDB] channel process died, reason: ~0p", [Reason]),
+    {stop, Reason, State};
 handle_info(Info, State) ->
     logger:debug("~p unexpected_info: ~p, channel: ~p", [?MODULE, Info, State#state.channel]),
 
